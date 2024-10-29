@@ -9,11 +9,42 @@ from copy import copy
 ######## Miscellaneous ########
 
 def is_power_of_2(x):
-    return (x > 0) and ((x & (x - 1)) == 0) 
+    return (x > 0) and ((x & (x - 1)) == 0)
 
 ########## Encoder/Decoder pairs ##########
 
 ### Main encode/decode functions
+def sparc_encode_ldpc(code_params, awgn_var, rand_seed, ldpc_vec): 
+
+    check_code_params(code_params)
+    R,L,M = map(code_params.get,['R','L','M'])
+    K = code_params['K'] if code_params['modulated'] else 1
+
+    bit_len = ldpc_vec.size
+    beta0 = bin_arr_2_msg_vector(ldpc_vec, M, K)
+
+    # Construct base matrix W
+    tmp = code_params.copy()
+    tmp.update({'awgn_var':awgn_var})
+    W = create_base_matrix(**tmp)
+
+    # Update code_params
+    n = int(round(bit_len/R))   # Design codeword length
+    if W.ndim == 2:
+        Lr,_ = W.shape
+        Mr   = int(round(n/Lr))
+        n    = Mr * Lr          # Actual codeword length
+    R_actual = bit_len / n      # Actual rate
+    code_params.update({'n':n, 'R_actual':R_actual})
+
+    # Set up function to calculate A*beta
+    Ab, Az = sparc_transforms(W, L, M, n, rand_seed, code_params['complex'])
+
+    # Generate random codeword
+    x = Ab(beta0)
+
+    return beta0, x, Ab, Az
+
 def sparc_encode(code_params, awgn_var, rand_seed):
     '''
     Encode message to SPARC codeword
@@ -51,6 +82,23 @@ def sparc_encode(code_params, awgn_var, rand_seed):
     x = Ab(beta0)
 
     return bits_in, beta0, x, Ab, Az
+
+def sparc_decode_posterior_probs(y, code_params, decode_params, awgn_var, rand_seed, beta0, Ab=None, Az=None):
+    '''
+    Decode SPARC codeword
+    '''
+
+    check_decode_params(decode_params)
+
+    # Run AMP decoding (applies hard decision after final iteration)
+    beta, t_final, nmse, psi = sparc_amp_posterior_probs(y, code_params, decode_params,
+                                         awgn_var, rand_seed, beta0, Ab, Az)
+
+    # Whether or not we expect a section error.
+    # Can be quite accurate for non power-allocated SPARCs with large M and L.
+    expect_err = psi.mean() >= 0.001
+
+    return beta, t_final, nmse, expect_err
 
 def sparc_decode(y, code_params, decode_params, awgn_var, rand_seed, beta0, Ab=None, Az=None):
     '''
@@ -880,6 +928,124 @@ def sparc_transforms(W, L, M, n, rand_seed, csparc=False):
     return Ab, Az
 
 ######## AMP decoder ########
+def sparc_amp_posterior_probs(y, code_params, decode_params, awgn_var, rand_seed, beta0, Ab=None, Az=None):
+    """
+    AMP decoder for Spatially Coupled Sparse Regression Codes
+
+    y: received (noisy) output symbols
+    awgn_var: awgn channel noise variance
+    beta0: true message vector, only used to calculate NMSE.
+    Ab(x): computes design matrix `A` times `x` (`x` has length L*M)
+    Az(y): computes `A` transpose times `y` (`y` has length n)
+    """
+
+    # Get code parameters
+    P,R,L,M,n = map(code_params.get, ['P','R','L','M','n'])
+    K = code_params['K'] if code_params['modulated'] else 1
+
+    # Construct base matrix
+    tmp = code_params.copy()
+    tmp.update({'awgn_var':awgn_var})
+    W = create_base_matrix(**tmp)
+    assert 0 <= W.ndim <= 2
+
+    # Get decode parameters
+    t_max, rtol, phi_est_method = map(decode_params.get,
+                                      ['t_max','rtol','phi_est_method'])
+    assert phi_est_method==1 or phi_est_method==2
+
+    # Functions to calculate (A * beta) and (A.T * z) if needed
+    if (Ab is None) or (Az is None):
+        Ab, Az = sparc_transforms(W, L, M, n, rand_seed, code_params['complex'])
+
+    # Initialise variables
+    beta = np.zeros(L*M) if (K==1 or K==2) else np.zeros(L*M, dtype=complex)
+    z    = y                               # Residual (modified) vector
+    atol = 2*np.finfo(np.float).resolution # abs tolerance 4 early stopping
+    if W.ndim == 0:
+        gamma = W
+        nmse  = np.ones(t_max)
+    else:
+        if W.ndim == 2:
+            Lr = W.shape[0]               # Num of row blocks
+            Mr = n // Lr                  # Entries per row block
+        Lc    = W.shape[-1]               # Num of column blocks
+        Mc    = L*M // Lc                 # Entries per column block
+        gamma = np.dot(W, np.ones(Lc))/Lc # Residual var - noise var (length Lr)
+        nmse  = np.ones((t_max, Lc))      # NMSE of each column block
+
+
+    # Run AMP decoder
+    for t in range(t_max):
+        if t > 0:
+            psi_prev = np.copy(psi)
+            phi_prev = np.copy(phi)
+
+            if W.ndim == 0:
+                gamma = W * psi # approx residual_var - noise_var
+            else:
+                gamma = np.dot(W, psi)/Lc
+
+            # Modified residual z
+            b = gamma/phi_prev # Length Lr
+            if W.ndim != 2:
+                z = y - Ab(beta) + b*z
+            else:
+                z = y - Ab(beta) + b.repeat(Mr)*z
+
+        # Residual variance phi
+        if phi_est_method == 1:
+            phi = awgn_var + gamma
+        elif phi_est_method == 2:
+            if W.ndim != 2:
+                phi = (np.abs(z)**2).mean()
+            else:
+                phi = (np.abs(z)**2).reshape(Lr,-1).mean(axis=1)
+
+        # Effective noise variance tau
+        if W.ndim == 0:
+            tau     = (L*phi/n)/W # Scalar
+            tau_use = tau         # Scalar
+            phi_use = phi         # Scalar
+        elif W.ndim == 1:
+            tau     = (L*phi/n)/W    # Length Lc
+            tau_use = tau.repeat(Mc) # Length LM
+            phi_use = phi            # Scalar
+        elif W.ndim == 2:
+            tau     = (L/Mr)/np.dot(W.T,1/phi) # Length Lc
+            tau_use = tau.repeat(Mc)           # Length LM
+            phi_use = phi.repeat(Mr)           # Length n
+
+        # Update message vector beta
+        s    = beta + tau_use * Az(z/phi_use)
+        beta = msg_vector_mmse_estimator(s, tau_use, M, K)
+
+        # Update NMSE and estimate of NMSE
+        if W.ndim == 0:
+            psi       = 1 - (np.abs(beta)**2).sum()/L
+            nmse[t+1] = (np.abs(beta-beta0)**2).sum()/L
+        else:
+            psi       = 1 - (np.abs(beta)**2).reshape(Lc,-1).sum(axis=1)/(L/Lc)
+            nmse[t+1] = (np.abs(beta-beta0)**2).reshape(Lc,-1).sum(axis=1)/(L/Lc)
+
+        # Early stopping criteria
+        if t>0 and np.allclose(psi, psi_prev, rtol, atol=atol):
+            nmse[t:] = nmse[t]
+            break
+
+    t_final = t
+
+    # Obtain final beta estimate by doing hard decision
+    # Hard decision is done on s and not beta NOT on because s has the correct
+    # distributional property (true beta + Gaussian noise).
+    # So then doing hard decision on s is actually doing MAP estimation.
+    # Recall that beta^{t+1} is the MMSE estimator. Therefore, we can see this as
+    # doing MAP instead of MMSE in the last iteration.
+    # The BER analysis using SE parameter tau also assumes s is used.
+    # beta = msg_vector_map_estimator(s, M, K)
+
+    return beta, t_final, nmse, psi
+
 def sparc_amp(y, code_params, decode_params, awgn_var, rand_seed, beta0, Ab=None, Az=None):
     """
     AMP decoder for Spatially Coupled Sparse Regression Codes
